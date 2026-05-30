@@ -2,9 +2,7 @@ import json
 import logging
 import requests
 
-from urllib.parse import parse_qsl, urlparse
-
-from oauthlib.common import add_params_to_uri, generate_nonce, to_unicode
+from oauthlib.common import to_unicode
 from oauthlib.oauth2 import InsecureTransportError
 from oauthlib.oauth2 import is_secure_transport
 
@@ -33,7 +31,7 @@ class WeConnectSession(VWWebSession):
             'content-type': 'application/json',
             'content-version': '1',
             'x-newrelic-id': 'VgAEWV9QDRAEXFlRAAYPUA==',
-            'user-agent': 'Volkswagen/3.51.1-android/14',
+            'user-agent': 'Volkswagen/3.61.0-android/14',
             'accept-language': 'de-de',
             'Cache-Control': 'no-cache',
             'Pragma': 'no-cache',
@@ -66,34 +64,16 @@ class WeConnectSession(VWWebSession):
 
     def login(self):
         super(WeConnectSession, self).login()
-        authorizationUrl = self.authorizationUrl(url='https://identity.vwgroup.io/oidc/v1/authorize')
-        response = self.doWebAuth(authorizationUrl)
-        self.fetchTokens('https://emea.bff.cariad.digital/user-login/login/v1',
+        auth_url = self.authorizationUrl(url='https://identity.vwgroup.io/oidc/v1/authorize')
+        response = self.doWebAuth(auth_url)
+        self.fetchTokens('https://identity.vwgroup.io/oidc/v1/token',
                          authorization_response=response
                          )
 
     def refresh(self):
         self.refreshTokens(
-            'https://emea.bff.cariad.digital/login/v1/idk/token',
+            'https://identity.vwgroup.io/oidc/v1/token',
         )
-
-    def authorizationUrl(self, url, state=None, **kwargs):
-        if state is not None:
-            raise AuthentificationError('Do not provide state')
-
-        params = [(('redirect_uri', self.redirect_uri)),
-                  (('nonce', generate_nonce()))]
-
-        authUrl = add_params_to_uri('https://emea.bff.cariad.digital/user-login/v1/authorize', params)
-
-        tryLoginResponse: requests.Response = self.get(authUrl, allow_redirects=False, access_type=AccessType.NONE)
-        redirect = tryLoginResponse.headers['Location']
-        query = urlparse(redirect).query
-        params = dict(parse_qsl(query))
-        if 'state' in params:
-            self.state = params.get('state')
-
-        return redirect
 
     def clearTokens(self) -> None:
         """
@@ -115,20 +95,19 @@ class WeConnectSession(VWWebSession):
         self.parseFromFragment(authorization_response)
 
         if all(key in self.token for key in ('state', 'id_token', 'access_token', 'code')):
-            body: str = json.dumps(
-                {
-                    'state': self.token['state'],
-                    'id_token': self.token['id_token'],
-                    'redirect_uri': self.redirect_uri,
-                    'region': 'emea',
-                    'access_token': self.token['access_token'],
-                    'authorizationCode': self.token['code'],
-                })
+            body = {
+                'code': self.token['code'],
+                'redirect_uri': self.redirect_uri,
+                'client_id': self.client_id,
+                'grant_type': 'authorization_code',
+                'state': self.token['state'],
+                'id_token': self.token['id_token']
+            }
 
-            loginHeadersForm: CaseInsensitiveDict = self.headers
-            loginHeadersForm['accept'] = 'application/json'
+            loginHeadersForm = self.headers.copy()
+            loginHeadersForm['content-type'] = 'application/x-www-form-urlencoded; charset=utf-8'
 
-            tokenResponse = self.post(token_url, headers=loginHeadersForm, data=body, allow_redirects=False, access_type=AccessType.ID)
+            tokenResponse = self.post(token_url, headers=loginHeadersForm, data=body, allow_redirects=False, access_type=AccessType.NONE)
             if tokenResponse.status_code != requests.codes['ok']:
                 raise TemporaryAuthentificationError(f'Token could not be fetched due to temporary WeConnect failure: {tokenResponse.status_code}')
             token = self.parseFromBody(tokenResponse.text)
@@ -189,7 +168,7 @@ class WeConnectSession(VWWebSession):
         if headers is None:
             headers = self.headers
 
-        # First try to get from the current token property, then fall back to stored token
+        # Try to get from the current token property, then fall back to stored token
         if refresh_token is None:
             refresh_token = self.refreshToken
             # If still None, try to get from the token dict directly
@@ -199,30 +178,25 @@ class WeConnectSession(VWWebSession):
         if not refresh_token:
             raise AuthentificationError('No refresh token available. Please log in again.')
 
-        # Create headers matching the examples format
-        tHeaders = {
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "Volkswagen/3.51.1-android/14",
-            "x-android-package-name": "com.volkswagen.weconnect",
+        # Create body matching standard OIDC refresh token grant
+        body = {
+            'grant_type': 'refresh_token',
+            'refresh_token': refresh_token,
+            'client_id': self.client_id,
         }
 
-        # Create form data body matching the examples format
-        body = {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": self.client_id,
-        }
+        headers = headers.copy()
+        headers['content-type'] = 'application/x-www-form-urlencoded; charset=utf-8'
 
         # Request new tokens using POST with form data
         tokenResponse = self.post(
             token_url,
             data=body,
-            headers=tHeaders,
+            headers=headers,
             timeout=timeout,
             verify=verify,
             proxies=proxies,
+            access_type=AccessType.NONE
         )
         if tokenResponse.status_code == requests.codes['unauthorized']:
             LOG.error('Token refresh failed with 401 - server requests new authorization. Refresh token may be expired or invalid.')

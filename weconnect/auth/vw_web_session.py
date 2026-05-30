@@ -34,7 +34,7 @@ class VWWebSession(OpenIDSession):
         self.websession.proxies.update(self.proxies)
         self.websession.mount('https://', HTTPAdapter(max_retries=retries))
         self.websession.headers = CaseInsensitiveDict({
-            'user-agent': 'Volkswagen/3.51.1-android/14',
+            'user-agent': 'Volkswagen/3.61.0-android/14',
             'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,'
                       'application/signed-exchange;v=b3',
             'accept-language': 'en-US,en;q=0.9',
