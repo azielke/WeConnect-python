@@ -322,10 +322,14 @@ class VWWebSession(OpenIDSession):
             raise APICompatibilityError('Could not find state token in authorization page')
 
         # Create login form data
+        # Note: 'action=default' is required by Auth0 Universal Login to
+        # distinguish credential submission from other form actions.
+        # Without it, the login POST can be silently ignored.
         login_form = {
             'username': self.sessionuser.username,
             'password': self.sessionuser.password,
-            'state': state
+            'state': state,
+            'action': 'default'
         }
 
         # Post to login URL
