@@ -137,19 +137,31 @@ def test_login(email: str, password: str) -> bool:
     return True
 
 
+class RefreshLogCapture(logging.Handler):
+    """Capture log messages to detect which refresh path was used."""
+
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
 def test_refresh(email: str, password: str) -> bool:
-    """Test that refresh() correctly triggers a full re-login."""
+    """Test that refresh() works, and report whether a full login was needed."""
 
     print("=" * 60)
     print("OIDC Hybrid Flow — Token Refresh Test")
     print("=" * 60)
     print()
-    print("The hybrid flow issues NO refresh_token, so refresh()")
-    print("must perform a full re-login to get fresh tokens.")
+    print("The hybrid flow issues NO refresh_token, so refresh() first")
+    print("tries prompt=none (silent, using Auth0 SSO cookie), and only")
+    print("falls back to a full credential-based login if the cookie expired.")
     print()
 
     # Step 1: Initial login
-    print("[1/3] Initial login...")
+    print("[1/4] Initial login...")
     user = SessionUser(username=email, password=password)
     session = WeConnectSession(sessionuser=user)
     try:
@@ -159,13 +171,22 @@ def test_refresh(email: str, password: str) -> bool:
         return False
 
     old_token = session.accessToken
-    old_expiry = session.expiresAt
-    print(f"  ✅  Logged in — access_token:  {old_token[:20]}...{old_token[-10:]}")
-    print(f"      Expires at:  {old_expiry}")
+    print(f"  ✅  Logged in")
+    print(f"      access_token:  {old_token[:20]}...{old_token[-10:]}")
     print()
 
-    # Step 2: Call refresh (triggers re-login with hybrid flow)
-    print("[2/3] Calling session.refresh()...")
+    # Step 2: Expire the token (simulate time passing)
+    print("[2/4] Simulating token expiry...")
+    if session.token and 'expires_at' in session.token:
+        session.token['expires_at'] = 0  # force immediate expiry
+        print(f"  ✅  Token marked as expired (expires_at = 0)")
+    print()
+
+    # Step 3: Call refresh and capture how it happened
+    print("[3/4] Calling session.refresh()...")
+    log_capture = RefreshLogCapture()
+    logging.getLogger('weconnect').addHandler(log_capture)
+
     import time
     start = time.time()
     try:
@@ -174,26 +195,40 @@ def test_refresh(email: str, password: str) -> bool:
     except Exception as e:
         print(f"  ❌  Refresh failed: {type(e).__name__}: {e}")
         return False
+    finally:
+        logging.getLogger('weconnect').removeHandler(log_capture)
 
     new_token = session.accessToken
-    new_expiry = session.expiresAt
-    print(f"  ✅  Refresh complete in {elapsed:.1f}s")
-    print(f"      New access_token:  {new_token[:20]}...{new_token[-10:]}")
-    print(f"      New expires at:    {new_expiry}")
+    print(f"      Completed in {elapsed:.1f}s")
+    print(f"      New access_token:  {new_token[:20]}...{new_token[-10:]}" if new_token else "      No token!")
+
+    # Detect which path was used
+    silent_success = any('Silent re-authentication succeeded' in m for m in log_capture.messages)
+    silent_failed = any('Silent re-auth failed' in m for m in log_capture.messages)
+    full_login = any('Performing full re-login' in m for m in log_capture.messages)
+
+    print()
+    if silent_success:
+        print("  🔇  SILENT re-auth was sufficient!")
+        print("      Auth0 SSO session cookie was still valid — no login form needed.")
+        print("      Tokens refreshed transparently without credentials.")
+    elif silent_failed and full_login:
+        print("  🔐  FULL re-login was required.")
+        print("      Auth0 SSO session cookie had expired — credentials were re-sent.")
+        print(f"      Silent re-auth failure reason: {next((m for m in log_capture.messages if 'Silent re-auth failed' in m), 'unknown')}")
+    else:
+        print(f"  ⚠️  Could not determine refresh path from logs.")
+        if log_capture.messages:
+            print(f"      Captured messages: {log_capture.messages}")
 
     if old_token == new_token:
         print(f"  ⚠️  Token unchanged — refresh may have returned same session")
     else:
-        print(f"  ✅  Token was replaced (fresh login)")
-
-    if session.refreshToken:
-        print(f"  ⚠️  Refresh token present (unexpected for hybrid flow)")
-    else:
-        print(f"  ✅  No refresh token (expected — hybrid flow limitation)")
+        print(f"  ✅  Token was replaced")
     print()
 
-    # Step 3: Verify new token works
-    print("[3/3] Verifying new token with API call...")
+    # Step 4: Verify new token works
+    print("[4/4] Verifying new token with API call...")
     try:
         resp = session.get(
             'https://emea.bff.cariad.digital/vehicle/v1/vehicles',
@@ -212,13 +247,10 @@ def test_refresh(email: str, password: str) -> bool:
 
     print()
     print("=" * 60)
-    print("✅ Refresh test passed! Re-login on refresh works.")
-    print("=" * 60)
-    return True
-
-    print()
-    print("=" * 60)
-    print("✅ Login successful! Hybrid flow is working.")
+    if silent_success:
+        print("✅ Refresh test passed — silent re-auth works!")
+    else:
+        print("✅ Refresh test passed — full re-login fallback works!")
     print("=" * 60)
     return True
 
