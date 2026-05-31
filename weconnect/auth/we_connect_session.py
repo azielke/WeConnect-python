@@ -68,14 +68,34 @@ class WeConnectSession(VWWebSession):
                          )
 
     def refresh(self):
-        """Perform full re-login since OIDC hybrid flow does not issue refresh tokens.
+        """Refresh tokens via silent re-auth or fall back to full re-login.
 
-        The hybrid flow (response_type=code id_token token) delivers tokens
-        directly in the callback URL with no refresh_token for security
-        reasons. When the access_token expires, we must do a complete
-        re-authentication.
+        The OIDC hybrid flow (response_type=code id_token token) does not
+        issue a refresh_token. To get fresh tokens we re-authenticate:
+          1. First try prompt=none — if self.websession still has a valid
+             Auth0 SSO session cookie, Auth0 returns new tokens silently
+             without showing a login form.
+          2. If that fails (session expired, or Auth0 rejects silent auth),
+             fall back to a full login with credentials.
         """
-        LOG.info('No refresh token available (OIDC hybrid flow). Performing full re-login.')
+        LOG.info('Access token expired — attempting silent re-authentication via Auth0 session cookie.')
+        try:
+            # Try silent re-auth: add prompt=none so Auth0 uses the existing
+            # SSO session cookie instead of showing the login form.
+            auth_url = self.authorizationUrl(
+                url='https://identity.vwgroup.io/oidc/v1/authorize',
+                prompt='none',
+            )
+            response = self.doWebAuth(auth_url)
+            self.fetchTokens('https://identity.vwgroup.io/oidc/v1/token',
+                             authorization_response=response)
+            if self.accessToken:
+                LOG.info('Silent re-authentication succeeded (Auth0 session was still valid).')
+                return
+        except Exception as e:
+            LOG.debug('Silent re-auth failed (%s), falling back to full login.', e)
+
+        LOG.info('Performing full re-login with credentials.')
         self.login()
 
     def clearTokens(self) -> None:
