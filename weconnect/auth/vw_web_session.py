@@ -34,7 +34,7 @@ class VWWebSession(OpenIDSession):
         self.websession.proxies.update(self.proxies)
         self.websession.mount('https://', HTTPAdapter(max_retries=retries))
         self.websession.headers = CaseInsensitiveDict({
-            'user-agent': 'Volkswagen/3.51.1-android/14',
+            'user-agent': 'Volkswagen/3.61.0-android/14',
             'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,'
                       'application/signed-exchange;v=b3',
             'accept-language': 'en-US,en;q=0.9',
@@ -322,10 +322,14 @@ class VWWebSession(OpenIDSession):
             raise APICompatibilityError('Could not find state token in authorization page')
 
         # Create login form data
+        # Note: 'action=default' is required by Auth0 Universal Login to
+        # distinguish credential submission from other form actions.
+        # Without it, the login POST can be silently ignored.
         login_form = {
             'username': self.sessionuser.username,
             'password': self.sessionuser.password,
-            'state': state
+            'state': state,
+            'action': 'default'
         }
 
         # Post to login URL

@@ -1,18 +1,13 @@
 import json
 import logging
-import requests
 
-from urllib.parse import parse_qsl, urlparse
-
-from oauthlib.common import add_params_to_uri, generate_nonce, to_unicode
-from oauthlib.oauth2 import InsecureTransportError
-from oauthlib.oauth2 import is_secure_transport
+from oauthlib.common import to_unicode
 
 from requests.models import CaseInsensitiveDict
 from weconnect.auth.openid_session import AccessType
 
 from weconnect.auth.vw_web_session import VWWebSession
-from weconnect.errors import AuthentificationError, RetrievalError, TemporaryAuthentificationError
+from weconnect.errors import TemporaryAuthentificationError
 
 
 LOG = logging.getLogger("weconnect")
@@ -22,7 +17,7 @@ class WeConnectSession(VWWebSession):
     def __init__(self, sessionuser, **kwargs):
         super(WeConnectSession, self).__init__(client_id='a24fba63-34b3-4d43-b181-942111e6bda8@apps_vw-dilab_com',
                                                refresh_url='https://identity.vwgroup.io/oidc/v1/token',
-                                               scope='openid profile badge cars dealers vin',
+                                               scope='openid profile badge cars dealers vin offline_access',
                                                redirect_uri='weconnect://authenticated',
                                                state=None,
                                                sessionuser=sessionuser,
@@ -33,7 +28,7 @@ class WeConnectSession(VWWebSession):
             'content-type': 'application/json',
             'content-version': '1',
             'x-newrelic-id': 'VgAEWV9QDRAEXFlRAAYPUA==',
-            'user-agent': 'Volkswagen/3.51.1-android/14',
+            'user-agent': 'Volkswagen/3.61.0-android/14',
             'accept-language': 'de-de',
             'Cache-Control': 'no-cache',
             'Pragma': 'no-cache',
@@ -66,34 +61,42 @@ class WeConnectSession(VWWebSession):
 
     def login(self):
         super(WeConnectSession, self).login()
-        authorizationUrl = self.authorizationUrl(url='https://identity.vwgroup.io/oidc/v1/authorize')
-        response = self.doWebAuth(authorizationUrl)
-        self.fetchTokens('https://emea.bff.cariad.digital/user-login/login/v1',
+        auth_url = self.authorizationUrl(url='https://identity.vwgroup.io/oidc/v1/authorize')
+        response = self.doWebAuth(auth_url)
+        self.fetchTokens('https://identity.vwgroup.io/oidc/v1/token',
                          authorization_response=response
                          )
 
     def refresh(self):
-        self.refreshTokens(
-            'https://emea.bff.cariad.digital/login/v1/idk/token',
-        )
+        """Refresh tokens via silent re-auth or fall back to full re-login.
 
-    def authorizationUrl(self, url, state=None, **kwargs):
-        if state is not None:
-            raise AuthentificationError('Do not provide state')
+        The OIDC hybrid flow (response_type=code id_token token) does not
+        issue a refresh_token. To get fresh tokens we re-authenticate:
+          1. First try prompt=none — if self.websession still has a valid
+             Auth0 SSO session cookie, Auth0 returns new tokens silently
+             without showing a login form.
+          2. If that fails (session expired, or Auth0 rejects silent auth),
+             fall back to a full login with credentials.
+        """
+        LOG.info('Access token expired — attempting silent re-authentication via Auth0 session cookie.')
+        try:
+            # Try silent re-auth: add prompt=none so Auth0 uses the existing
+            # SSO session cookie instead of showing the login form.
+            auth_url = self.authorizationUrl(
+                url='https://identity.vwgroup.io/oidc/v1/authorize',
+                prompt='none',
+            )
+            response = self.doWebAuth(auth_url)
+            self.fetchTokens('https://identity.vwgroup.io/oidc/v1/token',
+                             authorization_response=response)
+            if self.accessToken:
+                LOG.info('Silent re-authentication succeeded (Auth0 session was still valid).')
+                return
+        except Exception as e:
+            LOG.debug('Silent re-auth failed (%s), falling back to full login.', e)
 
-        params = [(('redirect_uri', self.redirect_uri)),
-                  (('nonce', generate_nonce()))]
-
-        authUrl = add_params_to_uri('https://emea.bff.cariad.digital/user-login/v1/authorize', params)
-
-        tryLoginResponse: requests.Response = self.get(authUrl, allow_redirects=False, access_type=AccessType.NONE)
-        redirect = tryLoginResponse.headers['Location']
-        query = urlparse(redirect).query
-        params = dict(parse_qsl(query))
-        if 'state' in params:
-            self.state = params.get('state')
-
-        return redirect
+        LOG.info('Performing full re-login with credentials.')
+        self.login()
 
     def clearTokens(self) -> None:
         """
@@ -112,42 +115,37 @@ class WeConnectSession(VWWebSession):
         authorization_response=None,
         **kwargs
     ):
+        """Extract tokens from OIDC hybrid flow callback URL.
+
+        With hybrid flow (response_type=code id_token token), the OAuth
+        callback URL already contains access_token and id_token directly.
+        No server-side token exchange is needed because Auth0 binds the
+        authorization code to the CARIAD BFF as the authorized exchanger —
+        a direct POST to identity.vwgroup.io/oidc/v1/token would return
+        401 access_denied.
+
+        This follows the same approach as robinostlund/volkswagencarnet#333.
+        """
         self.parseFromFragment(authorization_response)
 
-        if all(key in self.token for key in ('state', 'id_token', 'access_token', 'code')):
-            body: str = json.dumps(
-                {
-                    'state': self.token['state'],
-                    'id_token': self.token['id_token'],
-                    'redirect_uri': self.redirect_uri,
-                    'region': 'emea',
-                    'access_token': self.token['access_token'],
-                    'authorizationCode': self.token['code'],
-                })
+        if self.token is None:
+            raise TemporaryAuthentificationError('Failed to parse tokens from authorization response')
 
-            loginHeadersForm: CaseInsensitiveDict = self.headers
-            loginHeadersForm['accept'] = 'application/json'
+        if 'access_token' not in self.token:
+            raise TemporaryAuthentificationError(
+                'No access token found in authorization response. '
+                'The OIDC hybrid flow callback did not return an access token.'
+            )
 
-            tokenResponse = self.post(token_url, headers=loginHeadersForm, data=body, allow_redirects=False, access_type=AccessType.ID)
-            if tokenResponse.status_code != requests.codes['ok']:
-                raise TemporaryAuthentificationError(f'Token could not be fetched due to temporary WeConnect failure: {tokenResponse.status_code}')
-            token = self.parseFromBody(tokenResponse.text)
+        LOG.info('Successfully obtained tokens from OIDC hybrid flow callback')
+        LOG.debug('Access token expires in: %s seconds', self.token.get('expires_in', 'unknown'))
 
-            # Ensure the token is properly stored in the session
-            if token is not None:
-                self.token = token  # Explicitly store the token
-                LOG.debug(f"Successfully fetched tokens. Access token expires in: {token.get('expires_in', 'unknown')} seconds")
-                LOG.debug(f"Refresh token available: {'refresh_token' in token}")
-                # Verify critical tokens are present
-                if not all(key in token for key in ('access_token', 'id_token', 'refresh_token')):
-                    LOG.warning("Some expected tokens are missing from the response")
-            else:
-                LOG.error("Token parsing returned None")
+        # OIDC hybrid flow does not return refresh_token for security
+        # reasons. Re-login will be required when the access_token expires.
+        if 'refresh_token' not in self.token:
+            LOG.debug('No refresh token in response (expected with hybrid flow)')
 
-            return token
-        else:
-            LOG.error("Authorization response missing required tokens")
-            return None
+        return self.token
 
     def parseFromBody(self, token_response, state=None):
         try:
@@ -177,65 +175,12 @@ class WeConnectSession(VWWebSession):
         proxies=None,
         **kwargs
     ):
-        LOG.info('Refreshing tokens')
-        if not token_url:
-            raise ValueError("No token endpoint set for auto_refresh.")
+        """Token refresh is not available with OIDC hybrid flow.
 
-        if not is_secure_transport(token_url):
-            raise InsecureTransportError()
-
-        refresh_token = refresh_token or self.refreshToken
-
-        if headers is None:
-            headers = self.headers
-
-        # First try to get from the current token property, then fall back to stored token
-        if refresh_token is None:
-            refresh_token = self.refreshToken
-            # If still None, try to get from the token dict directly
-            if refresh_token is None and self.token is not None:
-                refresh_token = self.token.get('refresh_token')
-
-        if not refresh_token:
-            raise AuthentificationError('No refresh token available. Please log in again.')
-
-        # Create headers matching the examples format
-        tHeaders = {
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "Volkswagen/3.51.1-android/14",
-            "x-android-package-name": "com.volkswagen.weconnect",
-        }
-
-        # Create form data body matching the examples format
-        body = {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": self.client_id,
-        }
-
-        # Request new tokens using POST with form data
-        tokenResponse = self.post(
-            token_url,
-            data=body,
-            headers=tHeaders,
-            timeout=timeout,
-            verify=verify,
-            proxies=proxies,
-        )
-        if tokenResponse.status_code == requests.codes['unauthorized']:
-            LOG.error('Token refresh failed with 401 - server requests new authorization. Refresh token may be expired or invalid.')
-            raise AuthentificationError('Refreshing tokens failed: Server requests new authorization. Please log in again.')
-        elif tokenResponse.status_code in (requests.codes['internal_server_error'], requests.codes['service_unavailable'], requests.codes['gateway_timeout']):
-            raise TemporaryAuthentificationError(f'Token could not be refreshed due to temporary WeConnect failure: {tokenResponse.status_code}')
-        elif tokenResponse.status_code == requests.codes['ok']:
-            newToken = self.parseFromBody(tokenResponse.text)
-            if newToken is not None and "refresh_token" not in newToken:
-                LOG.debug("No new refresh token given. Re-using old.")
-                self.token["refresh_token"] = refresh_token
-                # Update the token property as well
-                self.token = newToken
-            return newToken
-        else:
-            raise RetrievalError(f'Status Code from WeConnect while refreshing tokens was: {tokenResponse.status_code}')
+        The hybrid flow does not return a refresh_token — Auth0 issues no
+        refresh tokens for security reasons with response_type=code id_token
+        token. When tokens expire, a full re-login is required.
+        """
+        LOG.info('Token refresh not available (OIDC hybrid flow). Performing full re-login.')
+        self.login()
+        return self.token
